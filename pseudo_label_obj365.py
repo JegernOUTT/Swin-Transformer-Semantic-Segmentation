@@ -8,6 +8,7 @@ from typing import List, Dict
 import cv2
 import numpy as np
 import torch
+from skimage.transform import resize
 from dssl_dl_datasets import Hasty, Internal
 from dssl_dl_utils import ImageAnnotations, Size2D, BitmapMask, MaskType, Instance, Bbox, ImageInfo
 from tqdm import tqdm
@@ -43,12 +44,16 @@ CLASSNAMES = (
 )
 
 
-def _postprocess_seg_map(seg_map: np.ndarray) -> List[BitmapMask]:
+def _postprocess_seg_map(seg_map: np.ndarray, original_size: Size2D) -> List[BitmapMask]:
+    if original_size.width != seg_map.shape[1] or original_size.height != seg_map.shape[0]:
+        seg_map = resize(seg_map, (original_size.height, original_size.width),
+                         order=0, preserve_range=True)
+
     def _get_mask_by_index(idx, category_name):
         result = np.zeros_like(seg_map, dtype=np.uint8)
         result[seg_map == idx] = 255
-        return BitmapMask(result, image_size=Size2D(width=seg_map.shape[1], height=seg_map.shape[0]),
-                          category_name=category_name, mask_type=MaskType.SemanticSegmentation)
+        return BitmapMask(result, image_size=original_size, category_name=category_name,
+                          mask_type=MaskType.SemanticSegmentation)
 
     return [_get_mask_by_index(idx, cls_name)
             for idx, cls_name in enumerate(CLASSNAMES)]
@@ -76,7 +81,7 @@ def convert_batchnorm(module, process_group=None):
     return module_output
 
 
-def _infer(args, filenames: List[ImageAnnotations], wait_key=1) -> Dict[str, np.ndarray]:
+def _infer(args, filenames: List[ImageAnnotations], max_size=2048, wait_key=1) -> Dict[str, np.ndarray]:
     model = init_segmentor(args.config, args.checkpoint, device=args.device)
     model = convert_batchnorm(model)
     model.eval()
@@ -88,10 +93,20 @@ def _infer(args, filenames: List[ImageAnnotations], wait_key=1) -> Dict[str, np.
     # cv2.namedWindow('demo', cv2.WINDOW_KEEPRATIO)
     for filename in tqdm(filenames, desc='Images inference'):
         frame = cv2.imread(str(filename))
+        original_size = Size2D(width=frame.shape[1], height=frame.shape[0])
+        if original_size.width > max_size or original_size.height > max_size:
+            if original_size.width >= original_size.height:
+                new_size = Size2D(width=max_size, height=int(max_size * (original_size.height / original_size.width)))
+                frame = cv2.resize(frame, (new_size.width, new_size.height))
+            else:
+                new_size = Size2D(width=int(max_size * (original_size.width / original_size.height)), height=max_size)
+                frame = cv2.resize(frame, (new_size.width, new_size.height))
+        else:
+            new_size = original_size
+
         with torch.no_grad():
             result = inference_segmentor(model, frame)
-        yield ImageInfo(filename=filename, size=Size2D(width=frame.shape[1], height=frame.shape[0])),\
-              _postprocess_seg_map(result[0])
+        yield ImageInfo(filename=filename, size=original_size), _postprocess_seg_map(result[0], original_size)
         # img = model.show_result(frame, result, palette=get_palette(args.palette), show=False)
         # cv2.imshow('demo', img)
         # ch = cv2.waitKey(wait_key) & 0xFF
